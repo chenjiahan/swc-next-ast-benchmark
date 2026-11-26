@@ -31,3 +31,23 @@ Both engines parse with comments enabled and access the program and comments dur
 The log and job summary report median times for parsing, each transform, all five transforms, printing and the pipeline. Per-sample stage sums and wall times are recorded separately. The latter includes per-file bookkeeping. Startup, file I/O, corpus decompression, warmup and correctness checks run outside the measurement.
 
 Before timing, the suite verifies a representative edit from each plugin, reparses every printed file with Babel, and compares output hashes and per-plugin edit counts across engines for every file. Artifacts include a machine-readable sample report and Markdown summary. Compare ratios within each runner; hosted runner hardware varies.
+
+## Optimization experiment
+
+After the original benchmark, run `node prepare-index.mjs` and `node optimize.mjs`. The experiment uses the same native releases, inputs, five rules and checked printer. Each of the twelve variants gets twelve samples by default. Their positions and immediate predecessors rotate between rounds. Set `BENCH_ROUNDS` for shorter local runs.
+
+| Strategy                | What happens inside the timed pipeline                                                                                                               |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Original                | Run all five visitors in five ordered passes.                                                                                                        |
+| Fused                   | Merge the five visitors into one tree traversal. This measures a scheduling change. Overlapping plugins can observe a different order.               |
+| ESTree object index     | Build a candidate index by walking the decoded objects, then apply the rules in order.                                                               |
+| ESTree decode index     | Record candidates while decoding ordinary ESTree objects. Candidate discovery is included in parse time.                                             |
+| ESTree pool index       | Add a printer fast path to the decode index. Eligible string literals store the quoted spelling once and reference its UTF-8 interior for the value. |
+| AstView flat index      | Scan the binary kind and payload columns. Handle top-level static imports directly, with walker fallbacks for nested or dynamic forms.               |
+| AstView range index     | Also share eligible raw and cooked string ranges when editing static imports.                                                                        |
+| AstView reachable index | Also follow native child IDs for dynamic modules and shorthand properties. This removes additional wrapper allocations and full visitor passes.      |
+| Plain I/O               | Parse and print the original program with zero plugins. This control generates different output from the transformed runs.                           |
+
+The indexed strategies specialize in these five rules. Both engines use the same shortcut for normalized relative paths. Indexing, module resolution and edits are timed for every file, including the measured pass after warmup. There is no result cache across files or runs. The AstView prototypes use the pinned private binary layout. The ESTree codec prototypes build into separate bundles. The original bundles and the checked native printer are used as correctness references.
+
+The harness compares the output hash and all five edit counts for each file, and reparses all outputs with Babel. Additional fixtures test ordered plugins with edits inside deleted JSX attributes, assignment patterns, escaped identifiers, quoted and Unicode module names, nested modules and dynamic imports. The controls are compared to each other. CI logs and artifacts report stage medians, whole-pipeline wall times, and the raw samples for each runner.

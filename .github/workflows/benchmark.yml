@@ -92,9 +92,15 @@ jobs:
           path: results
       - name: Verify outputs and benchmark parse, five transforms and print
         run: node compare.mjs
+      - name: Build the experimental ESTree codecs
+        run: node prepare-index.mjs
+      - name: Verify and benchmark optimized pipelines
+        run: node optimize.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.os }}
           path: |
             results/summary.md
             results/samples.json
+            results/optimization.md
+            results/optimization.json

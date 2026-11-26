@@ -11,7 +11,7 @@ export const names = [
   "expand-shorthand",
 ];
 
-export function compilePlugins(api, view, fileSet) {
+export function createPluginHooks(api, view, fileSet) {
   const wrap = (callback) =>
     view ? (ctx) => callback(ctx.node, ctx) : callback;
   const literal = (value, original) => {
@@ -70,30 +70,10 @@ export function compilePlugins(api, view, fileSet) {
     )
       return;
     const name = source.value;
-    if ((!name.startsWith("./") && !name.startsWith("../")) || extname(name))
-      return;
-    const path = resolve(dirname(ctx.state.file), name);
-    for (const stem of ["", "/index"]) {
-      for (const extension of [
-        ".ts",
-        ".tsx",
-        ".js",
-        ".jsx",
-        ".mts",
-        ".mjs",
-        ".cts",
-        ".cjs",
-      ]) {
-        if (!fileSet.has(path + stem + extension)) continue;
-        const outputExtension = [".mjs", ".mts"].includes(extension)
-          ? ".mjs"
-          : [".cjs", ".cts"].includes(extension)
-            ? ".cjs"
-            : ".js";
-        node.source = literal(name + stem + outputExtension, source);
-        ctx.state.counts[1]++;
-        return;
-      }
+    const next = resolveModule(name, ctx.state, fileSet);
+    if (next !== undefined) {
+      node.source = literal(next, source);
+      ctx.state.counts[1]++;
     }
   }
   const markers = new Set([
@@ -150,5 +130,54 @@ export function compilePlugins(api, view, fileSet) {
     { JSXAttribute: wrap(stripMarker) },
     { BinaryExpression: { leave: wrap(foldNumbers) } },
     { Property: wrap(expandShorthand) },
-  ].map((visitor) => api.createWalker(visitor));
+  ];
+}
+
+export function compilePlugins(api, view, fileSet) {
+  return createPluginHooks(api, view, fileSet).map((hooks) =>
+    api.createWalker(hooks),
+  );
+}
+
+export function resolveModule(name, state, fileSet) {
+  if ((!name.startsWith("./") && !name.startsWith("../")) || extname(name))
+    return;
+  const path = resolve(dirname(state.file), name);
+  return outputName(path, name, fileSet);
+}
+
+export function resolveIndexedModule(name, state, fileSet) {
+  // For a simple relative specifier, the canonical absolute file ID already
+  // contains the normalized parent directory. All other forms use POSIX resolution.
+  if (!/^\.\/(?:[\w@-]+\/)*[\w@-]+$/.test(name))
+    return resolveModule(name, state, fileSet);
+  const directory = (state.directory ??= state.file.slice(
+    0,
+    state.file.lastIndexOf("/") + 1,
+  ));
+  return outputName(directory + name.slice(2), name, fileSet);
+}
+
+function outputName(path, name, fileSet) {
+  for (const stem of ["", "/index"]) {
+    for (const extension of [
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".mts",
+      ".mjs",
+      ".cts",
+      ".cjs",
+    ]) {
+      if (!fileSet.has(path + stem + extension)) continue;
+      const out =
+        extension === ".mts" || extension === ".mjs"
+          ? ".mjs"
+          : extension === ".cts" || extension === ".cjs"
+            ? ".cjs"
+            : ".js";
+      return name + stem + out;
+    }
+  }
 }

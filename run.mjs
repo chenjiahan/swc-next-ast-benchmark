@@ -7,8 +7,19 @@ import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { compilePlugins, names } from "./plugins.mjs";
 
+import { compileExperiment } from "./optimized.mjs";
+
+const strategy = process.env.BENCH_STRATEGY;
+const bundle =
+  strategy === "pool-index"
+    ? "pooled"
+    : strategy === "decode-index"
+      ? "indexed"
+      : "index";
 const [engine, mode, label] = process.argv.slice(2);
-const api = await import("./build/" + engine + "/npm/core/dist/index.js");
+const api = await import(
+  "./build/" + engine + "/npm/core/dist/" + bundle + ".js"
+);
 const babel = createRequire(resolve("build/estree/npm/core/package.json"))(
   "@babel/parser",
 );
@@ -21,11 +32,19 @@ const files = rows.map((row) => ({
     comments: "all",
   },
 }));
-const plugins = compilePlugins(
-  api,
-  engine === "view",
-  new Set([...files.map((f) => f.file), "/demo/helper.ts"]),
-);
+const fileSet = new Set([
+  ...files.map((f) => f.file),
+  "/demo/helper.ts",
+  "/demo/中文.ts",
+  '/demo/a"b.ts',
+]);
+const reachableSites =
+  strategy === "reachable-index"
+    ? (await import("./reachable.mjs")).reachableSites
+    : undefined;
+const plugins = strategy
+  ? compileExperiment(api, engine, strategy, fileSet, reachableSites)
+  : compilePlugins(api, engine === "view", fileSet);
 function reparse(source, file) {
   const lang = file.options.lang;
   const plugins = [];
@@ -42,10 +61,18 @@ function smoke() {
   const source =
     'import { k } from "./helper"; const name = process.env.NODE_ENV; const el = <p data-testid="p" title={name}/>; export const obj = {name, sum: 2 + 3};';
   const ast = api.parseSync(source, { lang: "tsx" });
-  const state = { file: "/demo/entry.tsx", counts: Array(5).fill(0) };
+  const state = {
+    file: "/demo/entry.tsx",
+    sourceText: source,
+    counts: Array(5).fill(0),
+  };
   const program = ast.program;
   for (const plug of plugins) plug.walk(program, state);
   const { code } = api.generateSync(program);
+  if (strategy === "plain-io") {
+    assert.deepEqual(state.counts, [0, 0, 0, 0, 0]);
+    return;
+  }
   assert.deepEqual(state.counts, [1, 1, 1, 1, 1]);
   assert.match(code, /helper\.js/);
   assert.match(code, /["']production["']/);
@@ -54,6 +81,67 @@ function smoke() {
   assert.match(code, /sum:\s*5/);
 }
 smoke();
+// Fused visitors use tree order. The ordered variants must also preserve edit
+// counts when an early plugin edits a subtree that a later plugin removes.
+async function verifyInteractions() {
+  if (!strategy || ["fused", "plain-io"].includes(strategy)) return;
+  const baseline = await import(
+    "./build/" + engine + "/npm/core/dist/index.js"
+  );
+  const reference = compilePlugins(baseline, engine === "view", fileSet);
+  const cases = [
+    [
+      "js",
+      "const n = (1) + (2); class C { #NODE_ENV; read() { return process.env.#NODE_ENV } }",
+    ],
+    [
+      "js",
+      String.raw`const strings = ["中文", "","\uD800", "a\nb", "🦀", 'a"b'];`,
+    ],
+    [
+      "tsx",
+      '<X data-testid={{name,mode:process.env.NODE_ENV, mod:import("./helper"), n:1+2}} keep={{name,n:(1+2)*3}}/>',
+    ],
+    [
+      "js",
+      String.raw`const x = process.env.NOD\u0045_ENV; process.env.NODE_ENV = x; delete process.env.NODE_ENV; process.env?.NODE_ENV;`,
+    ],
+    ["js", "let x; ({x} = foo); const {x:y} = foo; const o = {x,__proto__};"],
+    [
+      "js",
+      `import "./中文"; export * from './a"b'; export {x} from "./helper";`,
+    ],
+    [
+      "ts",
+      'declare module "outer" { export {x} from "./helper"; } import(foo); import("./helper");',
+    ],
+    ["ts", 'declare module "outer" { export {x} from "./helper"; }'],
+    [
+      "tsx",
+      'const el = <X data-test-id={<Y data-testid="y"/>} other={{a}}/>; const n = (1+2)*(3-1);',
+    ],
+  ];
+  for (const [lang, sourceText] of cases) {
+    const apply = (pipeline, binding) => {
+      const program = binding.parseSync(sourceText, {
+        lang,
+        sourceType: "module",
+      }).program;
+      const state = {
+        file: "/demo/entry." + lang,
+        sourceText,
+        counts: Array(5).fill(0),
+      };
+      for (const plug of pipeline) plug.walk(program, state);
+      return [binding.generateSync(program).code, state.counts];
+    };
+    assert.deepEqual(
+      apply(plugins, api),
+      apply(reference, baseline),
+      sourceText,
+    );
+  }
+}
 const verify = mode === "verify";
 const empty = () => ({
   ms: Array(7).fill(0),
@@ -70,7 +158,7 @@ function pass(logValidation) {
   for (const f of files) {
     const tally = byGroup[f.group];
     const counts = Array(5).fill(0);
-    const state = { file: f.file, counts };
+    const state = { file: f.file, sourceText: f.source, counts };
     let phase = "parse";
     try {
       let at = performance.now();
@@ -80,13 +168,20 @@ function pass(logValidation) {
       let t = performance.now();
       tally.ms[0] += t - at;
       at = t;
-      for (let n = 0; n < 5; n++) {
-        phase = names[n];
-        plugins[n].walk(program, state);
+      if (strategy) {
+        phase = strategy;
+        for (const plug of plugins) plug.walk(program, state);
         t = performance.now();
-        tally.ms[n + 1] += t - at;
+        tally.ms[1] += t - at;
         at = t;
-      }
+      } else
+        for (let n = 0; n < 5; n++) {
+          phase = names[n];
+          plugins[n].walk(program, state);
+          t = performance.now();
+          tally.ms[n + 1] += t - at;
+          at = t;
+        }
       phase = "print";
       const code = api.generateSync(program).code;
       t = performance.now();
@@ -119,14 +214,19 @@ function pass(logValidation) {
   }
   return {
     engine,
+    strategy,
     byGroup,
     wallMs: performance.now() - start,
     ...(logValidation ? { records, errors } : {}),
   };
 }
 if (verify) {
+  await verifyInteractions();
   const report = pass(true);
-  writeFileSync("results/verify-" + engine + ".json", JSON.stringify(report));
+  writeFileSync(
+    "results/verify-" + (strategy ? strategy + "-" : "") + engine + ".json",
+    JSON.stringify(report),
+  );
   console.log(
     engine,
     report.byGroup,
