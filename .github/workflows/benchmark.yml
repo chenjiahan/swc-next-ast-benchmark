@@ -1,0 +1,100 @@
+name: AST benchmark
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  corpus:
+    name: Prepare React dashboard corpus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: rspack-contrib/build-tools-performance
+          ref: 2ab170cfb8e9376a301d691ea05d01851e72f2d7
+          path: fixture
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - run: npm install --global --force pnpm@12.18.0
+      - name: Install locked dashboard dependencies
+        working-directory: fixture
+        run: pnpm install --frozen-lockfile --filter performance-compare --filter react-dashboard
+      - run: node corpus.mjs fixture/cases/react-dashboard
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-corpus
+          path: results/corpus.json.gz
+          retention-days: 7
+
+  benchmark:
+    name: Benchmark (${{ matrix.os }})
+    needs: corpus
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true && git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: swc-project/swc-next
+          ref: 250fe5438b8f585a69011c85064e692771c151ed
+          path: build/estree
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: swc-project/swc-next
+          ref: 999405a004ae50ad342aea56e91df26cb3b86b36
+          path: build/view
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+      - run: npm install --global --force pnpm@11.17.0
+      - name: Build both Node APIs in release mode
+        run: |
+          for engine in estree view; do
+            (
+              cd "build/$engine"
+              rustc --version
+              pnpm install --frozen-lockfile --filter @swc-next/core... --filter swc-next
+              pnpm --filter @swc-next/core build --release
+              pnpm --filter @swc-next/core build:js
+            )
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-corpus
+          path: results
+      - name: Verify outputs and benchmark parse, five transforms and print
+        run: node compare.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.os }}
+          path: |
+            results/summary.md
+            results/samples.json
